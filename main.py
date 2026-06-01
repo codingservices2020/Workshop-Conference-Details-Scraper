@@ -23,7 +23,7 @@ import unicodedata
 import json
 import warnings
 from keep_alive import keep_alive
-
+keep_alive()
 
 from dotenv import load_dotenv
 load_dotenv()
