@@ -1,5 +1,6 @@
 import sys
 import os
+import base64
 import logging
 
 # Ensure Windows terminal support for Unicode and Emojis
@@ -475,6 +476,58 @@ def rewrite_custom_post_ai(paragraphs: list, has_media: bool = False) -> str:
         return ai_text.strip()
     except Exception as e:
         logger.error(f"Gemini API custom post formatting failed: {e}")
+        return None
+
+def rewrite_custom_post_from_image_ai(image_bytes: bytes) -> str:
+    """Uses Gemini 2.5 Flash to extract text from an image and structure it as a stunning Telegram post."""
+    if not GEMINI_API_KEY:
+        return None
+        
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    
+    system_prompt = CUSTOM_POST_SYSTEM_PROMPT + "\n\nCRITICAL: The user has attached media (photo/video). Therefore, the entire formatted HTML post MUST be strictly under 950 characters long (including all HTML tags and spaces) to ensure it fits within the Telegram caption limit. Please make the description and list items concise and dense."
+    
+    prompt = "Analyze this image, extract the text/information from it, and rewrite/format it into a STUNNING, highly professional, premium Telegram broadcast post according to the guidelines."
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": system_prompt},
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": image_b64
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=25)
+        response.raise_for_status()
+        res_json = response.json()
+        
+        # Extract response text
+        ai_text = res_json['candidates'][0]['content']['parts'][0]['text']
+        
+        # Clean any raw markdown blocks if AI returned them
+        if ai_text.startswith("```html"):
+            ai_text = ai_text.replace("```html", "", 1)
+        if ai_text.startswith("```"):
+            ai_text = ai_text.replace("```", "", 1)
+        if ai_text.endswith("```"):
+            ai_text = ai_text.rsplit("```", 1)[0]
+            
+        return ai_text.strip()
+    except Exception as e:
+        logger.error(f"Gemini API custom post from image failed: {e}")
         return None
 
 def rewrite_post_for_channel(title: str, paragraphs: list, image_url: str) -> str:
@@ -1072,14 +1125,28 @@ async def generate_and_preview_post(update: Update, context: ContextTypes.DEFAUL
                 'file_id': msg['file_id']
             })
             
-    # If there is no text but there is media, provide a basic description so Gemini knows what's up
-    if not paragraphs and media_list:
-        paragraphs.append("[Admin sent media without text description]")
+    # Check if only media and no text was sent, and the first media is a photo
+    formatted_text = None
+    if not paragraphs and media_list and media_list[0]['type'] == 'photo':
+        primary_media = media_list[0]
+        try:
+            # Download the image bytes from Telegram
+            file = await context.bot.get_file(primary_media['file_id'])
+            file_bytes = await file.download_as_bytearray()
+            formatted_text = rewrite_custom_post_from_image_ai(bytes(file_bytes))
+        except Exception as e:
+            logger.error(f"Failed to extract text from image: {e}")
+
+    # If it is not image-only, or image OCR/formatting failed, fallback to standard text formatting
+    if not formatted_text:
+        # If there is no text but there is media, provide a basic description so Gemini knows what's up
+        if not paragraphs and media_list:
+            paragraphs.append("[Admin sent media without text description]")
+            
+        # Generate styled post text, notifying Gemini if media is present
+        formatted_text = rewrite_custom_post_ai(paragraphs, has_media=bool(media_list))
         
-    # Generate styled post text, notifying Gemini if media is present
-    formatted_text = rewrite_custom_post_ai(paragraphs, has_media=bool(media_list))
-    
-    # Fallback if Gemini failed or key not set
+    # Fallback if Gemini failed completely or key not set
     if not formatted_text:
         formatted_text = "🔰 <b>CUSTOM BROADCAST POST</b> 🔰\n\n" + "\n\n".join(paragraphs)
         
