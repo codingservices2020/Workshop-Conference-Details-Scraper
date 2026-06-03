@@ -14,7 +14,7 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup, Tag, NavigableString
 from urllib.parse import urljoin
-from telegram import Update, LinkPreviewOptions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, LinkPreviewOptions, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from functools import wraps
 import re
@@ -23,7 +23,7 @@ import unicodedata
 import json
 import warnings
 from keep_alive import keep_alive
-keep_alive()
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -87,6 +87,22 @@ def admin_only(func):
                 return
         return await func(update, context, *args, **kwargs)
     return wrapper
+
+def get_admin_keyboard() -> ReplyKeyboardMarkup:
+    """Returns the persistent admin main reply keyboard markup."""
+    keyboard = [
+        [KeyboardButton("➕ Create Post"), KeyboardButton("🔍 Check Latest")],
+        [KeyboardButton("📋 List 10 Posts"), KeyboardButton("❓ Help")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_creating_post_keyboard() -> ReplyKeyboardMarkup:
+    """Returns the reply keyboard markup for when in the process of creating a post."""
+    keyboard = [
+        [KeyboardButton("✅ Done & Preview")],
+        [KeyboardButton("❌ Cancel")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def format_html_links(text_line: str) -> str:
     """
@@ -397,6 +413,70 @@ def rewrite_post_for_channel_ai(title: str, paragraphs: list) -> str:
         logger.error(f"Gemini API formatting failed, falling back to rule-based parser: {e}")
         return None
 
+CUSTOM_POST_SYSTEM_PROMPT = """
+You are an expert Telegram Channel Content Creator and Copywriter.
+Your task is to take the raw, unstructured messages/notes provided by the user and rewrite/format them into a STUNNING, highly professional, premium Telegram broadcast post.
+
+Follow these strict guidelines:
+1. Title: Create a bold, engaging title at the very top framed between 🔰 emojis, e.g., 🔰 <b>POST TITLE</b> 🔰. Always normalize styled font characters (such as math bold alphanumeric Unicode characters) back to standard uppercase letters.
+2. Structure: Group the information logically using relevant emojis (e.g. 📝 <b>Overview:</b>, 📚 <b>Key Points:</b>, 📅 <b>Dates:</b>, 🔗 <b>Links:</b>, etc.) depending on the content.
+3. Formatting:
+   - Use ONLY standard Telegram HTML tags: <b> (bold), <i> (italic), and <a href="..."> (links).
+   - Do NOT use Markdown symbols (like * or _ or [text](url)).
+   - Do NOT use unsupported HTML tags (like <p>, <ul>, <li>). Use simple '•' characters for list items.
+   - Keep the links fully clickable. Ensure the URLs themselves are kept outside of <b> tags so they remain clickable (e.g. '👉 <b>Link:</b> https://example.com').
+4. Content Adaptation:
+   - Organize the information into clean categories and output them as beautifully bulleted lists.
+   - OMIT any section that has no relevant information.
+"""
+
+def rewrite_custom_post_ai(paragraphs: list, has_media: bool = False) -> str:
+    """Uses Google Gemini 2.5 Flash to write a stunning, perfectly structured Telegram post from custom messages."""
+    if not GEMINI_API_KEY:
+        return None
+        
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    
+    paragraphs_text = "\n\n".join(paragraphs)
+    prompt = f"User Messages:\n{paragraphs_text}"
+    
+    system_prompt = CUSTOM_POST_SYSTEM_PROMPT
+    if has_media:
+        system_prompt += "\n\nCRITICAL: The user has attached media (photo/video). Therefore, the entire formatted HTML post MUST be strictly under 950 characters long (including all HTML tags and spaces) to ensure it fits within the Telegram caption limit. Please make the description and list items concise and dense."
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": system_prompt},
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+        res_json = response.json()
+        
+        # Extract response text
+        ai_text = res_json['candidates'][0]['content']['parts'][0]['text']
+        
+        # Clean any raw markdown blocks if AI returned them
+        if ai_text.startswith("```html"):
+            ai_text = ai_text.replace("```html", "", 1)
+        if ai_text.startswith("```"):
+            ai_text = ai_text.replace("```", "", 1)
+        if ai_text.endswith("```"):
+            ai_text = ai_text.rsplit("```", 1)[0]
+            
+        return ai_text.strip()
+    except Exception as e:
+        logger.error(f"Gemini API custom post formatting failed: {e}")
+        return None
+
 def rewrite_post_for_channel(title: str, paragraphs: list, image_url: str) -> str:
     """
     Intelligently rewrites and structures raw scraped paragraphs into a stunning,
@@ -632,7 +712,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Available commands:\n"
         "/check - Manually fetch the latest conference post right now\n"
         "/latest - List the latest 10 posts with clickable query buttons\n"
-        "/help - List all available commands and tips"
+        "/help - List all available commands and tips",
+        reply_markup=get_admin_keyboard()
     )
 
 @admin_only
@@ -644,7 +725,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📋 /latest - List the latest 10 posts with clickable numbered buttons\n"
         "🔍 /check - Instantly check and show the absolute latest post\n"
         "❓ /help - Show this help message with all commands\n\n"
-        "💡 <b>Tip:</b> You can also simply type and send a number between <b>1 and 10</b> to get full details for that post!"
+        "💡 <b>Tip:</b> You can also simply type and send a number between <b>1 and 10</b> to get full details for that post!",
+        reply_markup=get_admin_keyboard()
     )
 
 @admin_only
@@ -799,6 +881,307 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             
     elif data == "already_sent":
         await query.answer("This post has already been broadcast!", show_alert=True)
+        
+    elif data == "broadcast_custom_post":
+        formatted_text = context.user_data.get('custom_post_text')
+        media_list = context.user_data.get('custom_post_media', [])
+        
+        if not formatted_text:
+            await query.message.reply_text("❌ Error: No custom post content found to broadcast.")
+            return
+            
+        if not CHANNEL_OR_GROUP_ID:
+            await query.message.reply_text("❌ Error: CHANNEL_OR_GROUP_ID is not configured in your .env file.")
+            return
+            
+        if str(CHANNEL_OR_GROUP_ID).startswith("@"):
+            c_id = str(CHANNEL_OR_GROUP_ID).strip()
+        else:
+            c_id = int(CHANNEL_OR_GROUP_ID)
+            
+        await query.message.reply_text("📡 Broadcasting your custom post, please wait...")
+        
+        try:
+            if media_list:
+                # Send the first media with caption if text fits, else send separately
+                primary_media = media_list[0]
+                if primary_media['type'] == 'photo':
+                    if len(formatted_text) <= 1024:
+                        await context.bot.send_photo(
+                            chat_id=c_id,
+                            photo=primary_media['file_id'],
+                            caption=formatted_text,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await context.bot.send_photo(chat_id=c_id, photo=primary_media['file_id'])
+                        await context.bot.send_message(chat_id=c_id, text=formatted_text, parse_mode="HTML")
+                elif primary_media['type'] == 'video':
+                    if len(formatted_text) <= 1024:
+                        await context.bot.send_video(
+                            chat_id=c_id,
+                            video=primary_media['file_id'],
+                            caption=formatted_text,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await context.bot.send_video(chat_id=c_id, video=primary_media['file_id'])
+                        await context.bot.send_message(chat_id=c_id, text=formatted_text, parse_mode="HTML")
+                elif primary_media['type'] == 'sticker':
+                    await context.bot.send_sticker(chat_id=c_id, sticker=primary_media['file_id'])
+                    await context.bot.send_message(chat_id=c_id, text=formatted_text, parse_mode="HTML")
+                
+                # Send any remaining media items in sequence
+                for extra_media in media_list[1:]:
+                    if extra_media['type'] == 'photo':
+                        await context.bot.send_photo(chat_id=c_id, photo=extra_media['file_id'])
+                    elif extra_media['type'] == 'video':
+                        await context.bot.send_video(chat_id=c_id, video=extra_media['file_id'])
+                    elif extra_media['type'] == 'sticker':
+                        await context.bot.send_sticker(chat_id=c_id, sticker=extra_media['file_id'])
+            else:
+                # Text-only broadcast
+                await context.bot.send_message(
+                    chat_id=c_id,
+                    text=formatted_text,
+                    parse_mode="HTML"
+                )
+                
+            await query.message.reply_text(f"🎉 SUCCESS! Custom post has been successfully broadcast to {CHANNEL_OR_GROUP_ID}!")
+            
+            # Disable the button and change label to "✅ Sent"
+            keyboard = [[InlineKeyboardButton(text="✅ Sent", callback_data="already_sent")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+            
+            # Clear stored data
+            context.user_data['custom_post_text'] = None
+            context.user_data['custom_post_media'] = None
+            
+        except Exception as e:
+            logger.error(f"Error broadcasting custom post: {e}")
+            await query.message.reply_text(f"⚠️ Error broadcasting post: {e}")
+            
+    elif data == "cancel_custom_post":
+        context.user_data['custom_post_text'] = None
+        context.user_data['custom_post_media'] = None
+        
+        await query.message.reply_text("❌ Custom post discarded.")
+        # Edit markup to remove the buttons
+        await query.edit_message_reply_markup(reply_markup=None)
+
+@admin_only
+async def start_create_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Initiates the post creation flow."""
+    context.user_data['state'] = 'CREATING_POST'
+    context.user_data['post_messages'] = []
+    
+    await update.message.reply_text(
+        "Send me one or multiple messages you want to include in the post. It can be anything — a text, photo, video, even a sticker.",
+        reply_markup=get_creating_post_keyboard()
+    )
+
+@admin_only
+async def handle_creating_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Collects messages from the admin during post creation."""
+    message = update.message
+    
+    # Check for keyboard option inputs
+    if message.text:
+        text = message.text.strip()
+        if text == "❌ Cancel":
+            context.user_data['state'] = None
+            context.user_data['post_messages'] = []
+            await update.message.reply_text(
+                "❌ Post creation cancelled.",
+                reply_markup=get_admin_keyboard()
+            )
+            return
+        elif text == "✅ Done & Preview":
+            await generate_and_preview_post(update, context)
+            return
+
+    # Extract message information
+    msg_type = None
+    file_id = None
+    text_content = None
+    
+    if message.text:
+        msg_type = 'text'
+        text_content = message.text
+    elif message.photo:
+        msg_type = 'photo'
+        file_id = message.photo[-1].file_id
+        text_content = message.caption
+    elif message.video:
+        msg_type = 'video'
+        file_id = message.video.file_id
+        text_content = message.caption
+    elif message.sticker:
+        msg_type = 'sticker'
+        file_id = message.sticker.file_id
+    else:
+        # Unsupported type
+        await message.reply_text("⚠️ This message type is not supported. Please send text, photo, video, or a sticker.")
+        return
+        
+    # Save the collected message
+    context.user_data.setdefault('post_messages', []).append({
+        'type': msg_type,
+        'file_id': file_id,
+        'text': text_content
+    })
+    
+    # Confirm receipt of message with a friendly emoji notification
+    type_emojis = {'text': '📝 Text', 'photo': '📸 Photo', 'video': '🎥 Video', 'sticker': '🏷️ Sticker'}
+    emoji = type_emojis.get(msg_type, '📥 Message')
+    await message.reply_text(
+        f"{emoji} added! Send another one, or click *✅ Done & Preview* when you are finished.",
+        parse_mode="Markdown"
+    )
+
+@admin_only
+async def generate_and_preview_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Formats the collected messages using Gemini AI and presents a preview to the admin."""
+    messages = context.user_data.get('post_messages', [])
+    if not messages:
+        await update.message.reply_text(
+            "⚠️ You haven't sent any messages for the post yet! Please send some text or media, or click Cancel.",
+            reply_markup=get_creating_post_keyboard()
+        )
+        return
+        
+    # Inform the admin that we are formatting with Gemini AI
+    await update.message.reply_text(
+        "✨ Formatting post with Gemini AI, please wait...",
+        reply_markup=get_admin_keyboard() # Switch keyboard back immediately
+    )
+    
+    # Reset state immediately to prevent race conditions or double done clicks
+    context.user_data['state'] = None
+    
+    # Extract paragraphs and media list
+    paragraphs = []
+    media_list = []
+    for msg in messages:
+        if msg.get('text'):
+            paragraphs.append(msg['text'])
+        if msg.get('file_id'):
+            media_list.append({
+                'type': msg['type'],
+                'file_id': msg['file_id']
+            })
+            
+    # If there is no text but there is media, provide a basic description so Gemini knows what's up
+    if not paragraphs and media_list:
+        paragraphs.append("[Admin sent media without text description]")
+        
+    # Generate styled post text, notifying Gemini if media is present
+    formatted_text = rewrite_custom_post_ai(paragraphs, has_media=bool(media_list))
+    
+    # Fallback if Gemini failed or key not set
+    if not formatted_text:
+        formatted_text = "🔰 <b>CUSTOM BROADCAST POST</b> 🔰\n\n" + "\n\n".join(paragraphs)
+        
+    # Ensure it's under 1024 characters if media is present to fit Telegram caption limits
+    if media_list and len(formatted_text) > 1024:
+        # Strip HTML tags to avoid breaking tags during truncation
+        clean_text = re.sub(r'<[^>]*>', '', formatted_text)
+        if len(clean_text) > 1020:
+            formatted_text = clean_text[:1015] + "..."
+        else:
+            formatted_text = clean_text
+
+    # Store results in user_data for the callback broadcast handler
+    context.user_data['custom_post_text'] = formatted_text
+    context.user_data['custom_post_media'] = media_list
+    
+    # Send preview to the admin
+    keyboard = [
+        [InlineKeyboardButton("📢 Send to Channel/Group", callback_data="broadcast_custom_post")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_custom_post")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_html("👀 <b>Here is a preview of the post:</b>")
+    
+    # Send preview using the first media if available (similar to how we'll send it)
+    if media_list:
+        primary_media = media_list[0]
+        try:
+            if primary_media['type'] == 'photo':
+                if len(formatted_text) <= 1024:
+                    await update.message.reply_photo(
+                        photo=primary_media['file_id'],
+                        caption=formatted_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+                else:
+                    # Send photo, then formatted text separately
+                    await update.message.reply_photo(photo=primary_media['file_id'])
+                    await update.message.reply_html(formatted_text, reply_markup=reply_markup)
+            elif primary_media['type'] == 'video':
+                if len(formatted_text) <= 1024:
+                    await update.message.reply_video(
+                        video=primary_media['file_id'],
+                        caption=formatted_text,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await update.message.reply_video(video=primary_media['file_id'])
+                    await update.message.reply_html(formatted_text, reply_markup=reply_markup)
+            elif primary_media['type'] == 'sticker':
+                await update.message.reply_sticker(sticker=primary_media['file_id'])
+                await update.message.reply_html(formatted_text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"Error sending preview media: {e}")
+            await update.message.reply_html(
+                f"⚠️ Error rendering preview media, showing text preview instead.\n\n{formatted_text}",
+                reply_markup=reply_markup
+            )
+    else:
+        # Plain text post preview
+        await update.message.reply_html(formatted_text, reply_markup=reply_markup)
+
+@admin_only
+async def main_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Central entry point for handling user messages (text, photos, videos, stickers)."""
+    user_state = context.user_data.get('state')
+    message = update.message
+    
+    # 1. Handle creating post message flow if active
+    if user_state == 'CREATING_POST':
+        await handle_creating_post_message(update, context)
+        return
+        
+    # Check if the message is a text message
+    if message.text:
+        text = message.text.strip()
+        if text == "➕ Create Post":
+            await start_create_post(update, context)
+            return
+        elif text == "🔍 Check Latest":
+            await check(update, context)
+            return
+        elif text == "📋 List 10 Posts":
+            await latest(update, context)
+            return
+        elif text == "❓ Help":
+            await help_command(update, context)
+            return
+            
+        # Delegate digit inputs to standard behavior
+        if text.isdigit():
+            await text_message_handler(update, context)
+            return
+            
+    # Default fallback for other random messages or formats when not creating a post
+    await update.message.reply_text(
+        "💡 *Tip:* Use the buttons below to create a post, search, or get help.",
+        reply_markup=get_admin_keyboard()
+    )
 
 @admin_only
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -960,12 +1343,13 @@ def main() -> None:
     application.add_handler(CommandHandler("check", check))
     application.add_handler(CommandHandler("latest", latest))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("create", start_create_post))
 
     # Register callback query handler for inline button clicks
     application.add_handler(CallbackQueryHandler(button_click))
 
-    # Register text message handler for plain typed numbers (1-10)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
+    # Register main message handler for all incoming admin messages (text, media)
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, main_message_handler))
 
     # Run the bot until the process is interrupted
     application.run_polling()
